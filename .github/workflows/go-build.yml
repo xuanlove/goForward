@@ -7,15 +7,17 @@ on:
 jobs:
 
   build_and_upload_assets:
-    permissions: write-all
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
-        go-version: '1.20'
+        go-version: '1.21'
+        check-latest: true
 
     - name: Build Linux arm64
       run: |
@@ -23,12 +25,7 @@ jobs:
 
     - name: Zip Linux arm64
       run: |
-        sudo apt-get install -y zip
         zip goForward_arm64.zip goForward
-
-    - name: Delete goForward arm64
-      run: |
-        rm goForward
 
     - name: Build Linux amd64
       run: |
@@ -46,32 +43,10 @@ jobs:
       run: |
         zip goForward_win.zip goForward.exe
 
-    - name: Upload server asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Upload release assets
+      uses: softprops/action-gh-release@v2
       with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./goForward.zip
-        asset_name: goForward.zip
-        asset_content_type: application/zip
-
-    - name: Upload server asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./goForward_arm64.zip
-        asset_name: goForward_arm64.zip
-        asset_content_type: application/zip
-
-    - name: Upload server asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./goForward_win.zip
-        asset_name: goForward_win.zip
-        asset_content_type: application/zip
+        files: |
+          goForward.zip
+          goForward_arm64.zip
+          goForward_win.zip
