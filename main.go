@@ -1,13 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
+	"time"
 
 	"csz.net/goForward/conf"
 	"csz.net/goForward/forward"
@@ -17,20 +18,12 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// 运行态转发实例（用于 metrics 读取）
-var runtimeForwards = struct {
-	sync.RWMutex
-	m map[int]*forward.ConnectionStats
-}{m: make(map[int]*forward.ConnectionStats)}
-
 func main() {
-	// slog 默认 JSON 输出到 stdout
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
-
 	// 初始化停止信号注册表
 	conf.Registry = conf.NewStopRegistry()
 
-	go web.Run()
+	// 启动 Web 服务（返回 *http.Server 用于优雅关闭）
+	httpServer := web.Run()
 	web.SetMetricsProvider(collectMetrics)
 
 	if conf.TcpTimeout < 5 {
@@ -64,10 +57,8 @@ func main() {
 				MaxConns:      f.MaxConns,
 				HealthCheck:   f.HealthCheck,
 			},
-			TotalBytesOld:  f.TotalBytes,
-			TotalBytesLock: sync.Mutex{},
+			TotalBytesOld: f.TotalBytes,
 		}
-		registerRuntime(stats)
 		conf.Wg.Add(1)
 		go func(s *forward.ConnectionStats) {
 			forward.Run(s)
@@ -75,32 +66,33 @@ func main() {
 		}(stats)
 	}
 
-	// 监听退出信号
+	// 监听退出信号，优雅关闭：先停所有转发，再停 Web
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigCh
 		slog.Info("收到退出信号，开始优雅关闭", "signal", sig)
 		conf.Registry.StopAll()
+		// 等待转发协程退出后再关闭 Web（给 3 秒缓冲）
+		go func() {
+			time.Sleep(3 * time.Second)
+			if httpServer != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				httpServer.Shutdown(ctx)
+			}
+		}()
 	}()
 
 	conf.Wg.Wait()
 	slog.Info("所有转发已停止，进程退出")
 }
 
-// registerRuntime 登记运行态实例
-func registerRuntime(s *forward.ConnectionStats) {
-	runtimeForwards.Lock()
-	runtimeForwards.m[s.Id] = s
-	runtimeForwards.Unlock()
-}
-
-// collectMetrics 收集所有运行态实例的指标
+// collectMetrics 收集所有运行态实例的指标（通过 forward 包统一注册表）
 func collectMetrics() []web.ForwardMetric {
-	runtimeForwards.RLock()
-	defer runtimeForwards.RUnlock()
-	list := make([]web.ForwardMetric, 0, len(runtimeForwards.m))
-	for _, s := range runtimeForwards.m {
+	all := forward.AllRuntime()
+	list := make([]web.ForwardMetric, 0, len(all))
+	for _, s := range all {
 		s.TotalBytesLock.Lock()
 		m := web.ForwardMetric{
 			Id:            s.Id,
@@ -111,7 +103,7 @@ func collectMetrics() []web.ForwardMetric {
 			Status:        s.Status,
 			TotalBytes:    s.TotalBytes,
 			TotalGigabyte: s.TotalGigabyte,
-			ActiveConns:   0, // 由 forward 内部 atomic 提供；这里简化，实际可通过方法暴露
+			ActiveConns:   s.ActiveConns(),
 		}
 		s.TotalBytesLock.Unlock()
 		list = append(list, m)
@@ -120,6 +112,9 @@ func collectMetrics() []web.ForwardMetric {
 }
 
 func init() {
+	// slog 必须在所有其他初始化（配置加载、数据库）之前设置，保证日志格式统一
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
 	flag.StringVar(&conf.WebPort, "port", "8889", "Web Port")
 	flag.StringVar(&conf.Db, "db", "goForward.db", "Db Path")
 	flag.StringVar(&conf.WebIP, "ip", "0.0.0.0", "Web IP")

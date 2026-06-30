@@ -181,9 +181,9 @@ func DelForward(id int) bool {
 	return true
 }
 
-// ImportForwards 批量导入转发规则，返回成功条数与失败条数
+// ImportForwards 批量导入转发规则，返回成功导入的规则列表（含分配的 Id）与跳过条数
 // 已存在的（按 local_port+protocol）会被跳过。
-func ImportForwards(list []conf.ConnectionStats) (success, skipped int) {
+func ImportForwards(list []conf.ConnectionStats) (added []conf.ConnectionStats, skipped int) {
 	for i := range list {
 		f := list[i]
 		Normalize(&f)
@@ -192,7 +192,9 @@ func ImportForwards(list []conf.ConnectionStats) (success, skipped int) {
 			continue
 		}
 		if id := AddForward(f); id > 0 {
-			success++
+			f.Id = id
+			f.Status = conf.StatusRunning
+			added = append(added, f)
 		} else {
 			skipped++
 		}

@@ -2,6 +2,7 @@ package forward
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +14,15 @@ import (
 	"csz.net/goForward/conf"
 	"csz.net/goForward/sql"
 )
+
+// clientEntry UDP 客户端映射条目，记录地址与最后活跃时间
+type clientEntry struct {
+	addr     *net.UDPAddr
+	lastSeen time.Time
+}
+
+// udpClientTTL UDP 客户端映射条目过期时间
+const udpClientTTL = 5 * time.Minute
 
 // ConnectionStats 转发运行态结构体
 type ConnectionStats struct {
@@ -42,11 +52,52 @@ func StopKey(localPort, protocol string) string {
 	return localPort + protocol
 }
 
+// runtimeRegistry 全局运行态转发注册表，供 metrics 读取
+type runtimeRegistry struct {
+	mu sync.RWMutex
+	m  map[int]*ConnectionStats
+}
+
+var registry = &runtimeRegistry{m: make(map[int]*ConnectionStats)}
+
+// RegisterRuntime 登记运行态实例
+func RegisterRuntime(s *ConnectionStats) {
+	registry.mu.Lock()
+	registry.m[s.Id] = s
+	registry.mu.Unlock()
+}
+
+// UnregisterRuntime 反登记
+func UnregisterRuntime(id int) {
+	registry.mu.Lock()
+	delete(registry.m, id)
+	registry.mu.Unlock()
+}
+
+// AllRuntime 返回所有运行态实例的快照
+func AllRuntime() []*ConnectionStats {
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	list := make([]*ConnectionStats, 0, len(registry.m))
+	for _, s := range registry.m {
+		list = append(list, s)
+	}
+	return list
+}
+
+// ActiveConns 导出当前活动 TCP 连接数
+func (cs *ConnectionStats) ActiveConns() int64 {
+	return cs.activeConns.Load()
+}
+
 // Run 开启转发，负责分发具体转发
 func Run(stats *ConnectionStats) {
 	defer releaseResources(stats)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	RegisterRuntime(stats)
+	defer UnregisterRuntime(stats.Id)
 
 	key := StopKey(stats.LocalPort, stats.Protocol)
 	stopCh, unregister := conf.Registry.Register(key)
@@ -118,7 +169,8 @@ func (cs *ConnectionStats) runTCP(ctx context.Context, cancel context.CancelFunc
 		}
 		clientConn, err := listener.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			// listener 已关闭（停止信号或 ctx 取消），直接退出，不当作告警
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			slog.Warn("接受连接失败", "port", cs.LocalPort, "err", err)
@@ -206,9 +258,9 @@ func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc
 		cancel()
 	}()
 
-	// 远端响应转发回客户端的映射表：clientAddr.String() -> *net.UDPAddr
+	// 远端响应转发回客户端的映射表：clientAddr.String() -> clientEntry
 	var mapLock sync.Mutex
-	clients := make(map[string]*net.UDPAddr)
+	clients := make(map[string]*clientEntry)
 
 	// 远端 -> 客户端 回包转发协程
 	// 这里通过为每个客户端临时拨号到远端的方式实现：每收到一个客户端包，确保有一条到 remote 的 conn 用于读取响应。
@@ -232,7 +284,8 @@ func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc
 			}
 			n, err := remoteConn.Read(buf)
 			if err != nil {
-				if ctx.Err() != nil {
+				// conn 已关闭（停止信号），静默退出
+				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 					return
 				}
 				slog.Warn("UDP 读取远端响应失败", "port", cs.LocalPort, "err", err)
@@ -243,10 +296,37 @@ func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc
 			cs.TotalBytesLock.Unlock()
 			// 广播回所有已知客户端
 			mapLock.Lock()
-			for _, c := range clients {
-				conn.WriteToUDP(buf[:n], c)
+			now := time.Now()
+			for k, c := range clients {
+				if now.Sub(c.lastSeen) > udpClientTTL {
+					// 已过期，清理避免无限增长
+					delete(clients, k)
+					continue
+				}
+				conn.WriteToUDP(buf[:n], c.addr)
 			}
 			mapLock.Unlock()
+		}
+	}()
+
+	// 客户端映射定期清理协程（兜底，即便没有远端响应也能清理）
+	go func() {
+		ticker := time.NewTicker(udpClientTTL)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mapLock.Lock()
+				now := time.Now()
+				for k, c := range clients {
+					if now.Sub(c.lastSeen) > udpClientTTL {
+						delete(clients, k)
+					}
+				}
+				mapLock.Unlock()
+			}
 		}
 	}()
 
@@ -261,7 +341,8 @@ func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			bufPool.Put(buf)
-			if ctx.Err() != nil {
+			// conn 已关闭（停止信号），静默退出
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			slog.Warn("UDP 读取客户端失败", "port", cs.LocalPort, "err", err)
@@ -271,9 +352,9 @@ func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc
 		cs.TotalBytes += uint64(n)
 		cs.TotalBytesLock.Unlock()
 
-		// 登记客户端地址
+		// 登记客户端地址（带最后活跃时间）
 		mapLock.Lock()
-		clients[clientAddr.String()] = clientAddr
+		clients[clientAddr.String()] = &clientEntry{addr: clientAddr, lastSeen: time.Now()}
 		mapLock.Unlock()
 
 		// 直接转发原始数据（不加长度头，兼容标准 UDP）

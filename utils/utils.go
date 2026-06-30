@@ -23,16 +23,23 @@ func AddForward(newF conf.ConnectionStats) bool {
 
 // startForward 起一个转发协程并登记到 WaitGroup
 func startForward(id int, f conf.ConnectionStats) {
+	f.Id = id
+	StartForward(f)
+}
+
+// StartForward 起一个转发协程并登记到 WaitGroup（导出版本，供 web 导入后调用）
+func StartForward(f conf.ConnectionStats) {
 	stats := &forward.ConnectionStats{
 		ConnectionStats: conf.ConnectionStats{
-			Id:          id,
-			LocalPort:   f.LocalPort,
-			RemotePort:  f.RemotePort,
-			RemoteAddr:  f.RemoteAddr,
-			Protocol:    f.Protocol,
-			TotalBytes:  f.TotalBytes,
-			MaxConns:    f.MaxConns,
-			HealthCheck: f.HealthCheck,
+			Id:            f.Id,
+			LocalPort:     f.LocalPort,
+			RemotePort:    f.RemotePort,
+			RemoteAddr:    f.RemoteAddr,
+			Protocol:      f.Protocol,
+			TotalBytes:    f.TotalBytes,
+			TotalGigabyte: f.TotalGigabyte,
+			MaxConns:      f.MaxConns,
+			HealthCheck:   f.HealthCheck,
 		},
 		TotalBytesOld:  f.TotalBytes,
 		TotalBytesLock: sync.Mutex{},

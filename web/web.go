@@ -43,7 +43,7 @@ func SetMetricsProvider(p func() []ForwardMetric) {
 	metricsProvider = p
 }
 
-func Run() {
+func Run() *http.Server {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 	store := cookie.NewStore(generateSessionSecret())
@@ -188,8 +188,12 @@ func Run() {
 			msgPage(c, "导入失败，JSON解析失败:"+err.Error(), false)
 			return
 		}
-		s, sk := sql.ImportForwards(list)
-		msgPage(c, fmt.Sprintf("导入完成，成功 %d 条，跳过 %d 条", s, sk), true)
+		added, sk := sql.ImportForwards(list)
+		// 启动成功导入的转发规则
+		for _, f := range added {
+			utils.StartForward(f)
+		}
+		msgPage(c, fmt.Sprintf("导入完成，成功 %d 条，跳过 %d 条", len(added), sk), true)
 	})
 
 	r.GET("/pwd", func(c *gin.Context) {
@@ -215,10 +219,16 @@ func Run() {
 	})
 
 	slog.Info("Web管理面板启动", "ip", conf.WebIP, "port", conf.WebPort)
-	err := r.Run(net.JoinHostPort(conf.WebIP, conf.WebPort))
-	if err != nil {
-		slog.Error("Web启动失败", "err", err)
+	server := &http.Server{
+		Addr:    net.JoinHostPort(conf.WebIP, conf.WebPort),
+		Handler: r,
 	}
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Web启动失败", "err", err)
+		}
+	}()
+	return server
 }
 
 // parseForwardForm 解析表单字段为 ConnectionStats
