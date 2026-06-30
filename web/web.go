@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -149,7 +150,7 @@ func Run() {
 		c.Redirect(302, "/")
 	})
 	fmt.Println("Web管理面板端口:" + conf.WebPort)
-	err := r.Run(conf.WebIP + ":" + conf.WebPort)
+	err := r.Run(net.JoinHostPort(conf.WebIP, conf.WebPort))
 	if err != nil {
 		log.Panicln(err)
 	}

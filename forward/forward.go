@@ -53,7 +53,7 @@ func Run(stats *ConnectionStats) {
 		if err != nil {
 			log.Fatalln("解析本地地址时发生错误:", err)
 		}
-		remoteAddr, err := net.ResolveUDPAddr("udp", stats.RemoteAddr+":"+stats.RemotePort)
+		remoteAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(stats.RemoteAddr, stats.RemotePort))
 		if err != nil {
 			log.Fatalln("解析远程地址时发生错误:", err)
 		}
@@ -136,7 +136,7 @@ func Run(stats *ConnectionStats) {
 // TCP转发
 func (cs *ConnectionStats) handleTCPConnection(clientConn net.Conn, ctx context.Context, cancel context.CancelFunc) {
 	defer clientConn.Close()
-	remoteConn, err := net.Dial("tcp", cs.RemoteAddr+":"+cs.RemotePort)
+	remoteConn, err := net.Dial("tcp", net.JoinHostPort(cs.RemoteAddr, cs.RemotePort))
 	if err != nil {
 		log.Println("【"+cs.LocalPort+"】连接远程地址时发生错误:", err)
 		return
