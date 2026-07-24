@@ -15,10 +15,12 @@ import (
 	"csz.net/goForward/sql"
 )
 
-// clientEntry UDP 客户端映射条目，记录地址与最后活跃时间
-type clientEntry struct {
-	addr     *net.UDPAddr
-	lastSeen time.Time
+// udpSession 每个UDP客户端的会话，包含独立的远端连接，确保响应只回给对应客户端
+type udpSession struct {
+	remoteConn *net.UDPConn
+	clientAddr *net.UDPAddr
+	lastSeen   time.Time
+	cancel     context.CancelFunc
 }
 
 // udpClientTTL UDP 客户端映射条目过期时间
@@ -45,6 +47,16 @@ var bufPool = sync.Pool{
 	New: func() interface{} {
 		return make([]byte, 4096)
 	},
+}
+
+// getBuf 从池中获取一个 4096 字节的缓冲区。
+// 必须重切片到全容量，避免之前 Put 进来的短切片（buf[:n]）导致 Read 截断。
+func getBuf() []byte {
+	b := bufPool.Get().([]byte)
+	if cap(b) >= 4096 {
+		return b[:4096]
+	}
+	return make([]byte, 4096)
 }
 
 // StopKey 生成停止信号注册表使用的 key
@@ -236,6 +248,7 @@ func (cs *ConnectionStats) handleTCPConnection(clientConn net.Conn, ctx context.
 }
 
 // runUDP UDP 转发主循环（双向，兼容标准 UDP）
+// 每个客户端拥有独立的远端 UDP 连接，确保远端响应只回给对应客户端，避免多客户端串包。
 func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc, stopCh chan struct{}) error {
 	localAddr, err := net.ResolveUDPAddr("udp", ":"+cs.LocalPort)
 	if err != nil {
@@ -258,58 +271,22 @@ func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc
 		cancel()
 	}()
 
-	// 远端响应转发回客户端的映射表：clientAddr.String() -> clientEntry
+	// 每客户端会话表：clientAddr.String() -> *udpSession
 	var mapLock sync.Mutex
-	clients := make(map[string]*clientEntry)
+	sessions := make(map[string]*udpSession)
 
-	// 远端 -> 客户端 回包转发协程
-	// 这里通过为每个客户端临时拨号到远端的方式实现：每收到一个客户端包，确保有一条到 remote 的 conn 用于读取响应。
-	// 为简化实现，使用单条到 remote 的 UDP conn + 客户端映射 + 最近客户端指针。
-	remoteConn, err := net.DialUDP("udp", nil, remoteAddr)
-	if err != nil {
-		slog.Warn("UDP 拨号远端失败", "port", cs.LocalPort, "err", err)
-		return err
-	}
-	defer remoteConn.Close()
-
-	// 读取远端响应并写回最近活跃的客户端（兼容简单请求-响应场景，如 DNS）
-	go func() {
-		buf := bufPool.Get().([]byte)
-		defer bufPool.Put(buf)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			n, err := remoteConn.Read(buf)
-			if err != nil {
-				// conn 已关闭（停止信号），静默退出
-				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-					return
-				}
-				slog.Warn("UDP 读取远端响应失败", "port", cs.LocalPort, "err", err)
-				return
-			}
-			cs.TotalBytesLock.Lock()
-			cs.TotalBytes += uint64(n)
-			cs.TotalBytesLock.Unlock()
-			// 广播回所有已知客户端
-			mapLock.Lock()
-			now := time.Now()
-			for k, c := range clients {
-				if now.Sub(c.lastSeen) > udpClientTTL {
-					// 已过期，清理避免无限增长
-					delete(clients, k)
-					continue
-				}
-				conn.WriteToUDP(buf[:n], c.addr)
-			}
-			mapLock.Unlock()
+	// 退出时关闭所有会话的远端连接
+	defer func() {
+		mapLock.Lock()
+		for _, s := range sessions {
+			s.cancel()
+			s.remoteConn.Close()
 		}
+		sessions = make(map[string]*udpSession)
+		mapLock.Unlock()
 	}()
 
-	// 客户端映射定期清理协程（兜底，即便没有远端响应也能清理）
+	// 会话定期清理协程（清理过期会话及其远端连接）
 	go func() {
 		ticker := time.NewTicker(udpClientTTL)
 		defer ticker.Stop()
@@ -320,9 +297,11 @@ func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc
 			case <-ticker.C:
 				mapLock.Lock()
 				now := time.Now()
-				for k, c := range clients {
-					if now.Sub(c.lastSeen) > udpClientTTL {
-						delete(clients, k)
+				for k, s := range sessions {
+					if now.Sub(s.lastSeen) > udpClientTTL {
+						s.cancel()
+						s.remoteConn.Close()
+						delete(sessions, k)
 					}
 				}
 				mapLock.Unlock()
@@ -337,7 +316,7 @@ func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc
 			return nil
 		default:
 		}
-		buf := bufPool.Get().([]byte)
+		buf := getBuf()
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			bufPool.Put(buf)
@@ -352,24 +331,73 @@ func (cs *ConnectionStats) runUDP(ctx context.Context, cancel context.CancelFunc
 		cs.TotalBytes += uint64(n)
 		cs.TotalBytesLock.Unlock()
 
-		// 登记客户端地址（带最后活跃时间）
+		key := clientAddr.String()
 		mapLock.Lock()
-		clients[clientAddr.String()] = &clientEntry{addr: clientAddr, lastSeen: time.Now()}
+		sess, exists := sessions[key]
+		if !exists {
+			// 为新客户端创建独立的远端连接
+			remoteConn, derr := net.DialUDP("udp", nil, remoteAddr)
+			if derr != nil {
+				mapLock.Unlock()
+				bufPool.Put(buf)
+				slog.Warn("UDP 拨号远端失败", "port", cs.LocalPort, "err", derr)
+				continue
+			}
+			sessCtx, sessCancel := context.WithCancel(ctx)
+			sess = &udpSession{
+				remoteConn: remoteConn,
+				clientAddr: clientAddr,
+				lastSeen:   time.Now(),
+				cancel:     sessCancel,
+			}
+			sessions[key] = sess
+
+			// 该客户端专属的远端响应转发协程：读到响应只写回该客户端
+			go func(s *udpSession) {
+				rbuf := getBuf()
+				defer bufPool.Put(rbuf)
+				for {
+					select {
+					case <-sessCtx.Done():
+						return
+					default:
+					}
+					rn, rerr := s.remoteConn.Read(rbuf)
+					if rerr != nil {
+						if sessCtx.Err() != nil || errors.Is(rerr, net.ErrClosed) {
+							return
+						}
+						slog.Warn("UDP 读取远端响应失败", "port", cs.LocalPort, "err", rerr)
+						return
+					}
+					cs.TotalBytesLock.Lock()
+					cs.TotalBytes += uint64(rn)
+					cs.TotalBytesLock.Unlock()
+					conn.WriteToUDP(rbuf[:rn], s.clientAddr)
+				}
+			}(sess)
+		}
+		sess.lastSeen = time.Now()
+		remoteConn := sess.remoteConn
 		mapLock.Unlock()
 
-		// 直接转发原始数据（不加长度头，兼容标准 UDP）
-		go func(b []byte) {
+		// 直接转发原始数据到该客户端的专属远端连接
+		// 注意：传整个 buf 和 n，Put 时放回完整 buffer，避免短切片污染池
+		go func(b []byte, n int, rc *net.UDPConn) {
 			defer bufPool.Put(b)
-			if _, err := remoteConn.Write(b); err != nil {
+			if _, err := rc.Write(b[:n]); err != nil {
 				slog.Warn("UDP 写入远端失败", "port", cs.LocalPort, "err", err)
 			}
-		}(buf[:n])
+		}(buf, n, remoteConn)
 	}
 }
 
-// copyBytes 双向拷贝字节流
+// copyBytes 单向拷贝字节流（src -> dst）。
+// 当 src 读到 EOF（对端半关闭写端）时，只对 dst 调用 CloseWrite 发送 FIN，
+// 不全关闭 dst，以保证反向 goroutine 仍可读取对端尚未发出的回包。
+// 反向 goroutine 同理，二者都结束后由 handleTCPConnection 的 defer 统一关闭。
 func (cs *ConnectionStats) copyBytes(dst, src net.Conn) error {
-	buf := bufPool.Get().([]byte)
+	buf := getBuf()
 	defer bufPool.Put(buf)
 	for {
 		n, err := src.Read(buf)
@@ -378,7 +406,6 @@ func (cs *ConnectionStats) copyBytes(dst, src net.Conn) error {
 			cs.TotalBytes += uint64(n)
 			cs.TotalBytesLock.Unlock()
 			if _, werr := dst.Write(buf[:n]); werr != nil {
-				slog.Debug("写入目标失败", "port", cs.LocalPort, "err", werr)
 				return werr
 			}
 		}
@@ -386,12 +413,15 @@ func (cs *ConnectionStats) copyBytes(dst, src net.Conn) error {
 			break
 		}
 		if err != nil {
-			slog.Debug("读取源失败", "port", cs.LocalPort, "err", err)
 			break
 		}
 	}
-	dst.Close()
-	src.Close()
+	// 半关闭写端：尝试 CloseWrite，让对端看到 FIN 但仍可接收回包；非 TCP 退化为全关闭
+	if t, ok := dst.(*net.TCPConn); ok {
+		t.CloseWrite()
+	} else {
+		dst.Close()
+	}
 	return nil
 }
 
@@ -424,12 +454,12 @@ func (cs *ConnectionStats) printStats(ctx context.Context) {
 				cs.TotalBytesOld = cs.TotalBytes
 			} else {
 				if cs.Protocol == "tcp" {
+					// 先累加再判断：确保超时在到达 TcpTimeout 秒后立即触发，不多等一个 tick
+					cs.TcpTime += 10
 					if cs.TcpTime >= conf.TcpTimeout {
 						slog.Info("TCP 无传输超时，关闭所有连接", "port", cs.LocalPort)
 						closeTCPConnections(cs)
 						cs.TcpTime = 0
-					} else {
-						cs.TcpTime += 5
 					}
 				}
 			}

@@ -182,11 +182,16 @@ func DelForward(id int) bool {
 }
 
 // ImportForwards 批量导入转发规则，返回成功导入的规则列表（含分配的 Id）与跳过条数
-// 已存在的（按 local_port+protocol）会被跳过。
+// 已存在的（按 local_port+protocol）或必填字段为空的会被跳过。
 func ImportForwards(list []conf.ConnectionStats) (added []conf.ConnectionStats, skipped int) {
 	for i := range list {
 		f := list[i]
 		Normalize(&f)
+		// 验证必填字段，避免导入空规则导致监听失败
+		if f.LocalPort == "" || f.RemoteAddr == "" || f.RemotePort == "" {
+			skipped++
+			continue
+		}
 		if !FreeForward(f.LocalPort, f.Protocol) {
 			skipped++
 			continue

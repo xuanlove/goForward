@@ -73,18 +73,17 @@ func main() {
 		sig := <-sigCh
 		slog.Info("收到退出信号，开始优雅关闭", "signal", sig)
 		conf.Registry.StopAll()
-		// 等待转发协程退出后再关闭 Web（给 3 秒缓冲）
-		go func() {
-			time.Sleep(3 * time.Second)
-			if httpServer != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				httpServer.Shutdown(ctx)
-			}
-		}()
 	}()
 
 	conf.Wg.Wait()
+	// 所有转发协程已退出，现在优雅关闭 Web 服务
+	if httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(ctx); err != nil {
+			slog.Warn("Web 服务关闭异常", "err", err)
+		}
+	}
 	slog.Info("所有转发已停止，进程退出")
 }
 
