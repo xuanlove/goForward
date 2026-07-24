@@ -32,10 +32,10 @@ ping_result=$(ping -c 5 -q baidu.com | awk -F'/' 'END{print $5}')
 # 判断延迟是否在100以内
 if awk -v ping="$ping_result" 'BEGIN{exit !(ping < 100)}'; then
   echo "服务器位于中国国内，使用代理下载"
-  url="https://mirror.ghproxy.com/https://github.com/csznet/goForward/releases/latest/download/${FILE}"
+  url="https://mirror.ghproxy.com/https://github.com/xuanlove/goForward/releases/latest/download/${FILE}"
 else
   echo "服务器位于国外，不使用代理下载"
-  url="https://github.com/csznet/goForward/releases/latest/download/${FILE}"
+  url="https://github.com/xuanlove/goForward/releases/latest/download/${FILE}"
 fi
 
 # Download and unzip
